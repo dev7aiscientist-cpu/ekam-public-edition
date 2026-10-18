@@ -1,0 +1,1 @@
+{"dependencies":{"@hatch/space-sdk":"file:./sdk","drizzle-orm":"0.45.2","zod":"4.4.3"},"name":"ekam-public-edition","private":true,"scripts":{"start":"bun run host/host.ts"},"type":"module","version":"1.0.0"}
