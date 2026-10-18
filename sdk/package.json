@@ -1,0 +1,1 @@
+{"dependencies":{"zod":"4.4.3"},"description":"Standalone replacement for the Muse space SDK surface that EKAM's server actions use (defineAction + zod). Lets the exact same actions code run on any Bun host.","exports":{".":"./index.js"},"main":"index.js","name":"@hatch/space-sdk","type":"module","version":"0.13.0-standalone"}
