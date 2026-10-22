@@ -1,115 +1,137 @@
 // EKAM — Public Edition server actions.
 //
 // Accounts are per-visitor (name + email, session token). Everything —
-// keys, chats, runs, history, learning — is scoped to the signed-in user.
+// the key, chats, runs, history, learning — is scoped to the user.
 //
-// Developer setup is the app's key room: one slot per provider
-// (OpenRouter, NVIDIA, Groq, Gemini, Claude, Mistral AI, Cohere,
-// Together AI, Fireworks AI, DeepSeek, xAI, Hugging Face) plus one
-// image-generation door (fal.ai). The user creates a key on the
-// provider's own site, pastes it here, and the server makes ONE real
-// test call to that provider with it. The key is stored against the
-// user's account ONLY if that call genuinely succeeds; a refused key is
-// never stored. Full keys never leave the server — only last4 is shown.
+// NVIDIA-ONLY (founder's direction, 2026-10-19): EKAM Public runs on ONE
+// thing — the visitor's own NVIDIA API key (build.nvidia.com / NIM),
+// which unlocks the whole NVIDIA catalogue. Developer setup is a TASK
+// BOARD: one section per task, each naming the NVIDIA-catalogue model
+// chosen for that task, a "Paste the API key for this task" blank, and a
+// shortcut link to that model's own page on build.nvidia.com. The key is
+// a single per-user connection: saving it in ANY section stores it once
+// (after ONE real authenticated test call to the NVIDIA API), and every
+// section then shows Connected (last4). Model names live only in
+// Developer setup — the chat and the Adjust seats show capability
+// labels only.
 //
-// The workspace is a simple chat. Behind it the engine works invisibly:
-// a simple message is answered directly by the best connected provider;
-// a project-sized ask goes through the Divider AI (strict JSON plan
-// contract, server-side validator with one repair retry then a safe
-// fallback, parallel dispatch across the user's connected providers,
-// auto-combine) and the reply arrives as one chat answer. Provider and
-// model names live only in this file and in Developer setup — the chat
-// and the Adjust seats show capability labels only.
+// The workspace is a simple chat. Behind it the engine works invisibly
+// on the NVIDIA NIM API (https://integrate.api.nvidia.com/v1) with the
+// visitor's one key: the flagship model divides and combines, the
+// vision model sees images, and each capability routes to its chosen
+// NVIDIA-catalogue model with the flagship family as fallback.
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { and, asc, desc, eq } from "drizzle-orm";
 import * as schema from "./schema";
 
 // ---------------------------------------------------------------------------
-// Providers — the twelve key slots of Developer setup.
+// The NVIDIA catalogue — the models EKAM Public is built on. These ids
+// and page URLs come from the founder's own catalogue screenshots and
+// the task brief, verbatim.
 // ---------------------------------------------------------------------------
 
-export type ProviderId =
-  | "openrouter"
-  | "nvidia"
-  | "groq"
-  | "gemini"
-  | "claude"
-  | "mistral"
-  | "cohere"
-  | "together"
-  | "fireworks"
-  | "deepseek"
-  | "xai"
-  | "huggingface"
-  | "fal";
+const NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
-type ProviderDef = {
-  id: ProviderId;
-  name: string;
-  keyUrl: string;
-  keyHint: string;
-  // Neutral route label used everywhere outside Developer setup (the
-  // "How this was made" view, the learning record) — never a brand name.
-  routeLabel: string;
-  // "image" marks the one image-generation door (fal.ai); every other
-  // slot is a chat/text provider. Image generation never joins the
-  // divider's text routes — it has its own path in sendMessage.
-  purpose?: "image";
-  // A plain honesty line shown on the slot itself (fal is pay-as-you-go).
-  note?: string;
+const FLAGSHIP = "nvidia/nemotron-3-ultra-550b-a55b";
+const SUPER_VL = "nvidia/nemotron-3.5-super-vl-120b-a12b";
+const DEEPSEEK_FLASH = "deepseek-ai/deepseek-v4.1-flash";
+const LAGUNA = "poolside/laguna-xs-2.1";
+const LIGHTNING = "nvidia/nemotron-3.5-lightning-30b-a3b";
+const GLM_FLASH = "z-ai/glm-5-3-flash";
+const STEP5 = "stepfun-ai/step-5-preview";
+const FLUX_KLEIN = "black-forest-labs/flux-3-image-klein";
+
+// Neutral route labels used everywhere outside Developer setup (the
+// "How this was made" view, the learning record) — never a model name.
+const MODEL_ROUTE_LABELS: Record<string, string> = {
+  [FLAGSHIP]: "the flagship route",
+  [SUPER_VL]: "the vision route",
+  [DEEPSEEK_FLASH]: "the reasoning route",
+  [LAGUNA]: "the coding route",
+  [LIGHTNING]: "the fast route",
+  [GLM_FLASH]: "the multimodal route",
+  [STEP5]: "the experimental flagship route",
+  [FLUX_KLEIN]: "the image route",
 };
 
-const PROVIDERS: ProviderDef[] = [
-  { id: "openrouter", name: "OpenRouter", keyUrl: "https://openrouter.ai/keys", keyHint: "Real keys begin with “sk-or-” and are one long unbroken string.", routeLabel: "the combined route" },
-  { id: "nvidia", name: "NVIDIA", keyUrl: "https://build.nvidia.com/", keyHint: "Create an API key on NVIDIA's build site and copy the whole key.", routeLabel: "the accelerated route" },
-  { id: "groq", name: "Groq", keyUrl: "https://console.groq.com/keys", keyHint: "Real keys begin with “gsk_” and are one long unbroken string.", routeLabel: "the fast route" },
-  { id: "gemini", name: "Gemini (Google)", keyUrl: "https://aistudio.google.com/apikey", keyHint: "Create a key in Google AI Studio and copy the whole key.", routeLabel: "the multimodal route" },
-  { id: "claude", name: "Claude (Anthropic)", keyUrl: "https://console.anthropic.com/settings/keys", keyHint: "Real keys begin with “sk-ant-” and are one long unbroken string.", routeLabel: "the careful route" },
-  { id: "mistral", name: "Mistral AI", keyUrl: "https://console.mistral.ai/api-keys", keyHint: "Create a key in the Mistral console and copy the whole key.", routeLabel: "the european route" },
-  { id: "cohere", name: "Cohere", keyUrl: "https://dashboard.cohere.com/api-keys", keyHint: "Create a key in the Cohere dashboard and copy the whole key.", routeLabel: "the language route" },
-  { id: "together", name: "Together AI", keyUrl: "https://api.together.ai/settings/api-keys", keyHint: "Create a key in your Together settings and copy the whole key.", routeLabel: "the open-models route" },
-  { id: "fireworks", name: "Fireworks AI", keyUrl: "https://fireworks.ai/account/api-keys", keyHint: "Create a key in your Fireworks account and copy the whole key.", routeLabel: "the swift route" },
-  { id: "deepseek", name: "DeepSeek", keyUrl: "https://platform.deepseek.com/api_keys", keyHint: "Create a key on the DeepSeek platform and copy the whole key.", routeLabel: "the deep-thinking route" },
-  { id: "xai", name: "xAI (Grok)", keyUrl: "https://console.x.ai", keyHint: "Create a key in the xAI console and copy the whole key.", routeLabel: "the grok route" },
-  { id: "huggingface", name: "Hugging Face", keyUrl: "https://huggingface.co/settings/tokens", keyHint: "Real tokens begin with “hf_” — create an access token and copy the whole token.", routeLabel: "the community route" },
-  { id: "fal", name: "fal.ai", keyUrl: "https://fal.ai/dashboard/keys", keyHint: "Create an API key in your fal.ai dashboard and copy the whole key.", routeLabel: "the image route", purpose: "image", note: "Image generation runs on your own fal account — fal is pay-as-you-go, so each picture uses your fal credits, not EKAM's." },
-];
-
-const PROVIDER_BY_ID = new Map(PROVIDERS.map((p) => [p.id, p]));
-const ROUTE_LABELS: Record<ProviderId, string> = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.routeLabel])) as Record<ProviderId, string>;
+function routeLabelFor(model: string): string {
+  return MODEL_ROUTE_LABELS[model] ?? "the NVIDIA route";
+}
 
 // ---------------------------------------------------------------------------
-// The elite team — capability seats. Each seat lists the providers that
-// can serve it, best first; routing resolves that list onto the providers
-// the user has genuinely connected, and the learning record re-orders it.
+// The task board — Developer setup's sections. Core sections are the
+// seats the chat engine works through; "More NVIDIA powers" are further
+// catalogue models the same one key unlocks (presented as catalogue
+// powers — the chat engine is not claimed to call them).
+// ---------------------------------------------------------------------------
+
+type TaskSection = {
+  id: string;
+  task: string;
+  model: string;
+  modelUrl: string;
+  group: "core" | "more";
+  blurb: string;
+};
+
+const TASK_BOARD: TaskSection[] = [
+  { id: "flagship", task: "Flagship brain — chat, dividing, combining", model: FLAGSHIP, modelUrl: "https://build.nvidia.com/nvidia/nemotron-3-ultra-550b-a55b", group: "core", blurb: "EKAM's main mind — it divides your task into parts, does the strong work, and combines everything into one final answer." },
+  { id: "vision", task: "Vision — seeing images & screenshots", model: SUPER_VL, modelUrl: "https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b", group: "core", blurb: "Looks at the photos and screenshots you attach and describes what it sees, so the chat can work with them." },
+  { id: "reasoning", task: "Reasoning & maths", model: DEEPSEEK_FLASH, modelUrl: "https://build.nvidia.com/deepseek-ai/deepseek-v4.1-flash", group: "core", blurb: "Deep step-by-step thinking for maths, logic and hard problems." },
+  { id: "coding", task: "Coding & long jobs", model: LAGUNA, modelUrl: "https://build.nvidia.com/poolside/laguna-xs-2.1", group: "core", blurb: "Built for long, agentic coding jobs and terminal work that runs and runs." },
+  { id: "fast", task: "Fast replies", model: LIGHTNING, modelUrl: "https://build.nvidia.com/nvidia/nemotron-3.5-lightning-30b-a3b", group: "core", blurb: "The quick seat — everyday questions answered fast." },
+  { id: "multimodal", task: "Multimodal chat", model: GLM_FLASH, modelUrl: "https://build.nvidia.com/z-ai/glm-5-3-flash", group: "core", blurb: "A multimodal all-rounder that backs up the vision and chat seats." },
+  { id: "experimental", task: "Experimental flagship", model: STEP5, modelUrl: "https://build.nvidia.com/stepfun-ai/step-5-preview", group: "core", blurb: "A preview flagship with a huge context — the alternate strong mind when the flagship is busy." },
+  { id: "image", task: "Image creation & editing", model: FLUX_KLEIN, modelUrl: "https://build.nvidia.com/black-forest-labs/flux-3-image-klein", group: "core", blurb: "The picture seat — ask the chat for an image and this is the model EKAM asks. If NVIDIA's image endpoint doesn't serve it, the chat says so honestly instead of faking a picture." },
+  { id: "documents", task: "Documents & tables (OCR)", model: "nvidia/nemotron-parse-2.0", modelUrl: "https://build.nvidia.com/nvidia/nemotron-parse-2.0", group: "core", blurb: "Reads documents and pulls text and tables out of pages and images." },
+  { id: "translation", task: "Translation", model: "nvidia/riva-translate-4b-instruct-v2", modelUrl: "https://build.nvidia.com/nvidia/riva-translate-4b-instruct-v2", group: "core", blurb: "Translation across 37 languages, for pages, messages and documents." },
+  { id: "speech-to-text", task: "Speech to text", model: "nvidia/parakeet-tdt-0.6b", modelUrl: "https://build.nvidia.com/nvidia/parakeet-tdt-0.6b", group: "core", blurb: "Turns spoken audio into text across many languages, with punctuation and timestamps." },
+  { id: "text-to-speech", task: "Text to speech", model: "resemble-ai/chatterbox-multilingual-tts", modelUrl: "https://build.nvidia.com/resemble-ai/chatterbox-multilingual-tts", group: "core", blurb: "Natural, expressive voices in 23 languages for anything EKAM writes." },
+  { id: "embeddings", task: "Search inside files (embeddings)", model: "nvidia/nemotron-3-embed-1b", modelUrl: "https://build.nvidia.com/nvidia/nemotron-3-embed-1b", group: "core", blurb: "Semantic search and retrieval — finding the right passage inside big files and collections." },
+  { id: "muse-glimmer", task: "Multimodal reasoning", model: "meta/muse-glimmer-30b", modelUrl: "https://build.nvidia.com/meta/muse-glimmer-30b", group: "more", blurb: "A multimodal reasoning model accepting text and images, with native tool-calling." },
+  { id: "kimi-k3", task: "Reasoning flagship", model: "moonshotai/kimi-k3", modelUrl: "https://build.nvidia.com/moonshotai/kimi-k3", group: "more", blurb: "A very large reasoning model with tool calling and image input, unlocked by the same key." },
+  { id: "diffusiongemma", task: "Real-time text generation", model: "google/diffusiongemma-26b-a4b-it", modelUrl: "https://build.nvidia.com/google/diffusiongemma-26b-a4b-it", group: "more", blurb: "Diffusion-based text generation for real-time text apps." },
+  { id: "nemotron-ocr", task: "Text recognition (OCR)", model: "nvidia/nemotron-ocr-v2", modelUrl: "https://build.nvidia.com/nvidia/nemotron-ocr-v2", group: "more", blurb: "Multilingual end-to-end optical character recognition, tables included." },
+  { id: "kumo-tabular", task: "Prediction over tables", model: "nvidia/kumo-tabular", modelUrl: "https://build.nvidia.com/nvidia/kumo-tabular", group: "more", blurb: "Classification and regression over structured tables." },
+  { id: "kumo-relational", task: "Prediction over multi-table data", model: "nvidia/kumo-relational", modelUrl: "https://build.nvidia.com/nvidia/kumo-relational", group: "more", blurb: "A relational foundation model for prediction over structured, multi-table data." },
+  { id: "body-pose", task: "3D body pose from video", model: "nvidia/3d-body-pose", modelUrl: "https://build.nvidia.com/nvidia/3d-body-pose", group: "more", blurb: "Estimates 3D human body pose and skeleton from video input." },
+  { id: "wan-animate", task: "Character animation", model: "wan-ai/wan2.2-animate-2-14b", modelUrl: "https://build.nvidia.com/wan-ai/wan2.2-animate-2-14b", group: "more", blurb: "An end-to-end character animation framework for video." },
+  { id: "video-super-res", task: "Video upscaling", model: "nvidia/video-super-resolution-nim", modelUrl: "https://build.nvidia.com/nvidia/video-super-resolution-nim", group: "more", blurb: "Upscales encoded video to higher resolutions." },
+  { id: "ising", task: "Quantum & vision analysis", model: "nvidia/ising-calibration-1.5-31b", modelUrl: "https://build.nvidia.com/nvidia/ising-calibration-1.5-31b", group: "more", blurb: "A multimodal vision-language model built for quantum-computing analysis." },
+  { id: "qwen-image-edit", task: "Image editing — synthetic to photo", model: "nvidia/qwen-image-edit-nvpcb-ovsl2sl", modelUrl: "https://build.nvidia.com/nvidia/qwen-image-edit-nvpcb-ovsl2sl", group: "more", blurb: "An image-edit model specialised in turning synthetic renders photorealistic." },
+];
+
+// ---------------------------------------------------------------------------
+// The elite team — capability seats. Each seat lists the NVIDIA models
+// that can serve it, best first; every seat is served through the user's
+// one NVIDIA key, and the learning record re-orders proven models.
 // ---------------------------------------------------------------------------
 
 type Capability = {
   key: string;
   label: string;
-  servedBy: "connection" | "platform" | "fal";
-  providers: ProviderId[];
+  servedBy: "connection" | "platform" | "image";
+  models: string[];
   system: string;
 };
 
 const CAPABILITIES: Capability[] = [
-  { key: "code", label: "Best for code", servedBy: "connection", providers: ["claude", "deepseek", "mistral", "together", "fireworks", "xai", "openrouter", "groq", "nvidia", "gemini", "cohere", "huggingface"], system: "You are a specialist in writing clean, complete code. Return production-ready code with brief explanations." },
-  { key: "reasoning", label: "Best for reasoning & maths", servedBy: "connection", providers: ["deepseek", "claude", "xai", "groq", "openrouter", "mistral", "nvidia", "gemini", "together", "fireworks", "cohere", "huggingface"], system: "You are a specialist in deep reasoning, mathematics and logic. Show clear step-by-step thinking and a verified final answer." },
-  { key: "planning", label: "Best for planning", servedBy: "connection", providers: ["openrouter", "claude", "xai", "mistral", "nvidia", "groq", "gemini", "together", "fireworks", "deepseek", "cohere", "huggingface"], system: "You are a planning specialist. Turn a goal into a clear, ordered, actionable plan." },
-  { key: "data", label: "Best for data & formulas", servedBy: "connection", providers: ["nvidia", "openrouter", "deepseek", "groq", "claude", "gemini", "mistral", "together", "fireworks", "xai", "cohere", "huggingface"], system: "You are a data specialist. Return clean, valid structured output (JSON, tables, formulas) exactly in the requested shape." },
-  { key: "writing", label: "Best for writing", servedBy: "connection", providers: ["cohere", "claude", "gemini", "mistral", "openrouter", "groq", "nvidia", "xai", "together", "fireworks", "deepseek", "huggingface"], system: "You are a writing specialist. Produce polished, well-structured writing that matches the requested tone." },
-  { key: "research", label: "Best for research summaries", servedBy: "connection", providers: ["gemini", "cohere", "openrouter", "claude", "groq", "nvidia", "xai", "mistral", "together", "fireworks", "deepseek", "huggingface"], system: "You are a research specialist. Synthesise, summarise and organise material accurately and clearly." },
-  { key: "documents", label: "Best for documents", servedBy: "connection", providers: ["cohere", "gemini", "claude", "openrouter", "nvidia", "groq", "mistral", "together", "fireworks", "xai", "deepseek", "huggingface"], system: "You are a document specialist. Extract, structure and explain content from documents, tables and text clearly." },
-  { key: "translation", label: "Best for translation", servedBy: "connection", providers: ["cohere", "gemini", "openrouter", "claude", "mistral", "nvidia", "groq", "together", "fireworks", "xai", "deepseek", "huggingface"], system: "You are a translation specialist covering many languages including all major Indian languages. Translate faithfully and naturally." },
-  { key: "general", label: "Best for everyday questions", servedBy: "connection", providers: ["groq", "mistral", "together", "fireworks", "xai", "openrouter", "gemini", "claude", "nvidia", "cohere", "deepseek", "huggingface"], system: "You are a fast, helpful general assistant. Answer concisely and directly." },
-  { key: "vision", label: "Best for seeing images", servedBy: "connection", providers: ["gemini", "openrouter", "claude", "xai", "nvidia", "groq", "mistral", "together", "fireworks", "cohere", "deepseek", "huggingface"], system: "You are a vision specialist. Analyse visual material described to you and help with image-related work clearly and helpfully." },
-  // Image creation is served by the user's own fal.ai connection (the
-  // image-generation door in Developer setup) — never by the divider's
-  // text routes, so it stays out of DIVIDER_KEYS; sendMessage routes an
-  // image ask straight to fal. Voice still needs the platform pool.
-  { key: "image_creation", label: "Best for creating images", servedBy: "fal", providers: ["fal"], system: "" },
-  { key: "voice", label: "Best for voice & audio", servedBy: "platform", providers: [], system: "" },
+  { key: "code", label: "Best for code", servedBy: "connection", models: [LAGUNA, FLAGSHIP, STEP5], system: "You are a specialist in writing clean, complete code. Return production-ready code with brief explanations." },
+  { key: "reasoning", label: "Best for reasoning & maths", servedBy: "connection", models: [DEEPSEEK_FLASH, FLAGSHIP, STEP5], system: "You are a specialist in deep reasoning, mathematics and logic. Show clear step-by-step thinking and a verified final answer." },
+  { key: "planning", label: "Best for planning", servedBy: "connection", models: [FLAGSHIP, STEP5, LIGHTNING], system: "You are a planning specialist. Turn a goal into a clear, ordered, actionable plan." },
+  { key: "data", label: "Best for data & formulas", servedBy: "connection", models: [FLAGSHIP, DEEPSEEK_FLASH, STEP5], system: "You are a data specialist. Return clean, valid structured output (JSON, tables, formulas) exactly in the requested shape." },
+  { key: "writing", label: "Best for writing", servedBy: "connection", models: [FLAGSHIP, GLM_FLASH, LIGHTNING], system: "You are a writing specialist. Produce polished, well-structured writing that matches the requested tone." },
+  { key: "research", label: "Best for research summaries", servedBy: "connection", models: [FLAGSHIP, GLM_FLASH, STEP5], system: "You are a research specialist. Synthesise, summarise and organise material accurately and clearly." },
+  { key: "documents", label: "Best for documents", servedBy: "connection", models: [FLAGSHIP, SUPER_VL, GLM_FLASH], system: "You are a document specialist. Extract, structure and explain content from documents, tables and text clearly." },
+  { key: "translation", label: "Best for translation", servedBy: "connection", models: [FLAGSHIP, GLM_FLASH, LIGHTNING], system: "You are a translation specialist covering many languages including all major Indian languages. Translate faithfully and naturally." },
+  { key: "general", label: "Best for everyday questions", servedBy: "connection", models: [LIGHTNING, FLAGSHIP, GLM_FLASH], system: "You are a fast, helpful general assistant. Answer concisely and directly." },
+  { key: "vision", label: "Best for seeing images", servedBy: "connection", models: [SUPER_VL, GLM_FLASH, FLAGSHIP], system: "You are a vision specialist. Analyse visual material described to you and help with image-related work clearly and helpfully." },
+  // Image creation is served by the NVIDIA image seat (the flux model on
+  // the task board) — never by the divider's text routes; sendMessage
+  // routes an image ask straight to it. Voice still needs the platform.
+  { key: "image_creation", label: "Best for creating images", servedBy: "image", models: [FLUX_KLEIN], system: "" },
+  { key: "voice", label: "Best for voice & audio", servedBy: "platform", models: [], system: "" },
 ];
 
 const CAP_BY_KEY = new Map(CAPABILITIES.map((c) => [c.key, c]));
@@ -118,8 +140,8 @@ const DIVIDER_KEYS = CAPABILITIES.filter((c) => c.servedBy === "connection").map
 // ---------------------------------------------------------------------------
 // Adjust — the user's talking controls for chat. Per user, persisted, and
 // they genuinely govern every reply:
-//  - seats: which capability seats are ON. A seat can only be on while at
-//    least one provider that serves it is connected (platform seats never).
+//  - seats: which capability seats are ON. A seat can only be on while
+//    the NVIDIA key is connected (platform seats never).
 //  - howMany: caps how many parts (specialists) one ask may be split into.
 //  - thinking: reasoning/token budget — Light < Standard < Deep.
 //  - length: output-length target — Brief < Balanced < Detailed.
@@ -237,82 +259,32 @@ async function userForToken(ctx: Ctx, token: string | undefined): Promise<{ id: 
   return { id: user.id, name: user.name, email: user.email };
 }
 
-// All of the user's genuinely connected providers: provider id -> key.
-async function connectionsFor(ctx: Ctx, userId: number): Promise<Map<ProviderId, { apiKey: string; last4: string }>> {
+type NvidiaConn = { apiKey: string; last4: string };
+
+// The user's ONE NVIDIA connection. Rows stored for providers removed in
+// the NVIDIA-only rebuild are simply never read — they stay inert.
+async function nvidiaConnFor(ctx: Ctx, userId: number): Promise<NvidiaConn | null> {
   const db = ctx.db<typeof schema>();
-  const rows = await db.select().from(schema.connections).where(eq(schema.connections.userId, userId));
-  const map = new Map<ProviderId, { apiKey: string; last4: string }>();
-  for (const r of rows) {
-    if (PROVIDER_BY_ID.has(r.provider as ProviderId)) map.set(r.provider as ProviderId, { apiKey: r.apiKey, last4: r.last4 });
-  }
-  return map;
+  const rows = await db
+    .select()
+    .from(schema.connections)
+    .where(and(eq(schema.connections.userId, userId), eq(schema.connections.provider, "nvidia")))
+    .limit(1);
+  const row = rows[0];
+  return row ? { apiKey: row.apiKey, last4: row.last4 } : null;
 }
 
-// Can this capability seat work at all right now? Only while at least one
-// provider that serves it is connected.
-function seatServable(cap: Capability, conns: Map<ProviderId, unknown>): boolean {
-  return cap.servedBy !== "platform" && cap.providers.some((p) => conns.has(p));
+// Can this capability seat work at all right now? Text and image seats
+// work while the one NVIDIA key is connected; platform seats never yet.
+function seatServable(cap: Capability, hasConn: boolean): boolean {
+  return cap.servedBy !== "platform" && hasConn;
 }
 
 // ---------------------------------------------------------------------------
-// Provider calls — one chat call shape per provider, server-side only.
-// Model ids live here and never reach the client.
+// NVIDIA NIM calls — one OpenAI-compatible chat shape for every model,
+// server-side only. Model ids live here and in the task board; they
+// never reach the chat UI.
 // ---------------------------------------------------------------------------
-
-// OpenRouter keeps its class routing (ultra / super / vl / free); other
-// providers pick their model by the capability's first-choice class.
-const OR_MODELS = {
-  ultra: "nvidia/nemotron-3-ultra-550b-a55b:free",
-  super: "nvidia/nemotron-3-super-120b-a12b:free",
-  vl: "nvidia/nemotron-3.5-super-vl:free",
-  free: "openrouter/free",
-} as const;
-
-type OrClass = keyof typeof OR_MODELS;
-
-function orClassFor(cap: Capability): OrClass {
-  if (cap.key === "vision") return "vl";
-  if (cap.key === "code" || cap.key === "reasoning" || cap.key === "planning" || cap.key === "data") return "ultra";
-  return "super";
-}
-
-function modelFor(provider: ProviderId, cap: Capability): string {
-  switch (provider) {
-    case "openrouter":
-      return OR_MODELS[orClassFor(cap)];
-    case "nvidia":
-      return cap.key === "code" || cap.key === "reasoning" ? "nvidia/nemotron-3-super-120b-a12b" : "meta/llama-3.3-70b-instruct";
-    case "groq":
-      return cap.key === "code" || cap.key === "reasoning" || cap.key === "planning" ? "openai/gpt-oss-120b" : "llama-3.3-70b-versatile";
-    case "gemini":
-      return "gemini-2.5-flash";
-    case "claude":
-      return "claude-sonnet-4-5";
-    case "mistral":
-      if (cap.key === "code") return "codestral-latest";
-      if (cap.key === "general" || cap.key === "translation") return "mistral-small-latest";
-      return "mistral-large-latest";
-    case "cohere":
-      return cap.key === "general" || cap.key === "translation" ? "command-r7b-12-2024" : "command-a-03-2025";
-    case "together":
-      if (cap.key === "code") return "Qwen/Qwen2.5-Coder-32B-Instruct";
-      if (cap.key === "reasoning") return "deepseek-ai/DeepSeek-R1";
-      return "meta-llama/Llama-3.3-70B-Instruct-Turbo";
-    case "fireworks":
-      if (cap.key === "code") return "accounts/fireworks/models/qwen2p5-coder-32b-instruct";
-      if (cap.key === "reasoning") return "accounts/fireworks/models/deepseek-r1";
-      return "accounts/fireworks/models/llama-v3p3-70b-instruct";
-    case "deepseek":
-      return cap.key === "reasoning" ? "deepseek-reasoner" : "deepseek-chat";
-    case "xai":
-      return cap.key === "reasoning" || cap.key === "planning" ? "grok-4-1-fast-reasoning" : "grok-4-1-fast-non-reasoning";
-    case "huggingface":
-      return cap.key === "code" ? "Qwen/Qwen2.5-Coder-32B-Instruct" : "meta-llama/Llama-3.3-70B-Instruct";
-    case "fal":
-      // fal serves image generation only — it has no chat model.
-      return "";
-  }
-}
 
 type OaiChatResponse = {
   choices?: Array<{ message?: { content?: string | null; reasoning?: string | null; reasoning_content?: string | null } }>;
@@ -326,10 +298,10 @@ function extractOaiText(json: OaiChatResponse): string {
   return reasoning.trim();
 }
 
-async function callOpenAiStyle(url: string, apiKey: string, model: string, system: string, user: string, opts: { maxTokens: number; temperature: number; timeoutMs: number }, extraHeaders?: Record<string, string>): Promise<string> {
-  const res = await fetchWithTimeout(url, {
+async function callNvidiaChat(apiKey: string, model: string, system: string, user: string, opts: { maxTokens: number; temperature: number; timeoutMs: number }): Promise<string> {
+  const res = await fetchWithTimeout(NVIDIA_CHAT_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...(extraHeaders ?? {}) },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model,
       messages: [
@@ -350,124 +322,21 @@ async function callOpenAiStyle(url: string, apiKey: string, model: string, syste
   return text;
 }
 
-async function callGemini(apiKey: string, model: string, system: string, user: string, opts: { maxTokens: number; temperature: number; timeoutMs: number }): Promise<string> {
-  const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: system }] },
-      contents: [{ role: "user", parts: [{ text: user }] }],
-      generationConfig: { temperature: opts.temperature, maxOutputTokens: opts.maxTokens },
-    }),
-  }, opts.timeoutMs);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 140)}` : ""}`);
-  }
-  const json = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  const text = (json.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? "").join("").trim();
-  if (!text) throw new Error("Empty response");
-  return text;
-}
-
-async function callClaude(apiKey: string, model: string, system: string, user: string, opts: { maxTokens: number; temperature: number; timeoutMs: number }): Promise<string> {
-  const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model,
-      max_tokens: opts.maxTokens,
-      temperature: opts.temperature,
-      system,
-      messages: [{ role: "user", content: user }],
-    }),
-  }, opts.timeoutMs);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 140)}` : ""}`);
-  }
-  const json = (await res.json()) as { content?: Array<{ type?: string; text?: string }> };
-  const text = (json.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
-  if (!text) throw new Error("Empty response");
-  return text;
-}
-
-// Cohere's chat API (v2) — its own request/response shape.
-async function callCohere(apiKey: string, model: string, system: string, user: string, opts: { maxTokens: number; temperature: number; timeoutMs: number }): Promise<string> {
-  const res = await fetchWithTimeout("https://api.cohere.com/v2/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: opts.temperature,
-      max_tokens: opts.maxTokens,
-    }),
-  }, opts.timeoutMs);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 140)}` : ""}`);
-  }
-  const json = (await res.json()) as { message?: { content?: Array<{ type?: string; text?: string }> } };
-  const text = (json.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
-  if (!text) throw new Error("Empty response");
-  return text;
-}
-
-async function callProvider(provider: ProviderId, apiKey: string, cap: Capability, system: string, user: string, opts: { maxTokens: number; temperature: number; timeoutMs: number }): Promise<string> {
-  const model = modelFor(provider, cap);
-  switch (provider) {
-    case "openrouter":
-      return callOpenAiStyle("https://openrouter.ai/api/v1/chat/completions", apiKey, model, system, user, opts, { "X-Title": "EKAM Public" });
-    case "nvidia":
-      return callOpenAiStyle("https://integrate.api.nvidia.com/v1/chat/completions", apiKey, model, system, user, opts);
-    case "groq":
-      return callOpenAiStyle("https://api.groq.com/openai/v1/chat/completions", apiKey, model, system, user, opts);
-    case "gemini":
-      return callGemini(apiKey, model, system, user, opts);
-    case "claude":
-      return callClaude(apiKey, model, system, user, opts);
-    case "mistral":
-      return callOpenAiStyle("https://api.mistral.ai/v1/chat/completions", apiKey, model, system, user, opts);
-    case "cohere":
-      return callCohere(apiKey, model, system, user, opts);
-    case "together":
-      return callOpenAiStyle("https://api.together.xyz/v1/chat/completions", apiKey, model, system, user, opts);
-    case "fireworks":
-      return callOpenAiStyle("https://api.fireworks.ai/inference/v1/chat/completions", apiKey, model, system, user, opts);
-    case "deepseek":
-      return callOpenAiStyle("https://api.deepseek.com/chat/completions", apiKey, model, system, user, opts);
-    case "xai":
-      return callOpenAiStyle("https://api.x.ai/v1/chat/completions", apiKey, model, system, user, opts);
-    case "huggingface":
-      return callOpenAiStyle("https://router.huggingface.co/v1/chat/completions", apiKey, model, system, user, opts);
-    case "fal":
-      throw new Error("fal serves image generation, not chat");
-  }
-}
-
-// ONE real test call to the provider with a pasted key. The room's law:
-// the test is the smallest REAL chat call, never a model-list endpoint —
-// a list endpoint can answer without enforcing the key (the NVIDIA
-// lesson), so it proves nothing. Success means the provider itself
-// accepted the key on a genuine completion; anything else is a refusal
-// and nothing is stored. (OpenRouter is the one exception in shape: its
-// dedicated /auth/key endpoint exists precisely to enforce a key and
-// returns 401 for a refused one — it is not a model list.)
-// A key test is a one-time action on whatever network the user happens
-// to be on — give it a full minute before calling it unreachable, so a
-// slow first connection never produces a false "could not reach".
+// ONE real test call with a pasted key. The board's law: the test is the
+// smallest REAL authenticated chat call against the flagship model —
+// never a model-list endpoint, which can answer without enforcing the
+// key (the NVIDIA lesson). Success means NVIDIA itself accepted the key
+// on a genuine completion; anything else is a refusal and nothing is
+// stored. A key test gets a full minute, so a slow first connection
+// never produces a false "could not reach".
 const TEST_TIMEOUT_MS = 60000;
 
-function oaiChatTest(url: string, apiKey: string, model: string): Promise<Response> {
-  return fetchWithTimeout(url, {
+async function testNvidiaKey(apiKey: string): Promise<Response> {
+  return fetchWithTimeout(NVIDIA_CHAT_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
-      model,
+      model: FLAGSHIP,
       messages: [{ role: "user", content: "Hi" }],
       max_tokens: 1,
       temperature: 0,
@@ -475,99 +344,42 @@ function oaiChatTest(url: string, apiKey: string, model: string): Promise<Respon
   }, TEST_TIMEOUT_MS);
 }
 
-async function testProviderKey(provider: ProviderId, apiKey: string): Promise<Response> {
-  switch (provider) {
-    case "openrouter":
-      return fetchWithTimeout("https://openrouter.ai/api/v1/auth/key", { method: "GET", headers: { Authorization: `Bearer ${apiKey}` } }, TEST_TIMEOUT_MS);
-    case "nvidia":
-      return oaiChatTest("https://integrate.api.nvidia.com/v1/chat/completions", apiKey, "meta/llama-3.3-70b-instruct");
-    case "groq":
-      return oaiChatTest("https://api.groq.com/openai/v1/chat/completions", apiKey, "llama-3.3-70b-versatile");
-    case "gemini":
-      return fetchWithTimeout("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: "Hi" }] }],
-          generationConfig: { maxOutputTokens: 1, temperature: 0 },
-        }),
-      }, TEST_TIMEOUT_MS);
-    case "claude":
-      return fetchWithTimeout("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-5",
-          max_tokens: 1,
-          messages: [{ role: "user", content: "Hi" }],
-        }),
-      }, TEST_TIMEOUT_MS);
-    case "mistral":
-      return oaiChatTest("https://api.mistral.ai/v1/chat/completions", apiKey, "mistral-small-latest");
-    case "cohere":
-      return fetchWithTimeout("https://api.cohere.com/v2/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: "command-r7b-12-2024",
-          messages: [{ role: "user", content: "Hi" }],
-          max_tokens: 1,
-          temperature: 0,
-        }),
-      }, TEST_TIMEOUT_MS);
-    case "together":
-      return oaiChatTest("https://api.together.xyz/v1/chat/completions", apiKey, "meta-llama/Llama-3.3-70B-Instruct-Turbo");
-    case "fireworks":
-      return oaiChatTest("https://api.fireworks.ai/inference/v1/chat/completions", apiKey, "accounts/fireworks/models/llama-v3p3-70b-instruct");
-    case "deepseek":
-      return oaiChatTest("https://api.deepseek.com/chat/completions", apiKey, "deepseek-chat");
-    case "xai":
-      return oaiChatTest("https://api.x.ai/v1/chat/completions", apiKey, "grok-4-1-fast-non-reasoning");
-    case "huggingface":
-      return oaiChatTest("https://router.huggingface.co/v1/chat/completions", apiKey, "meta-llama/Llama-3.3-70B-Instruct");
-    case "fal":
-      // fal has no key-info or model-list endpoint that enforces a key,
-      // so the smallest REAL authenticated call is a queue submission
-      // for the image model itself: fal checks the key before accepting
-      // the job (a bad key is refused with 401), and the submitted job
-      // is the tiniest possible generation. Auth is fal's own scheme:
-      // "Authorization: Key <key>".
-      return fetchWithTimeout("https://queue.fal.run/fal-ai/flux/schnell", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Key ${apiKey}` },
-        body: JSON.stringify({ prompt: "a single small red dot on a plain white background", image_size: "square", num_images: 1, output_format: "jpeg" }),
-      }, TEST_TIMEOUT_MS);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Image generation via the user's fal connection. One real call to the
-// FLUX schnell endpoint on fal's synchronous host; the returned image
-// bytes are downloaded and stored as an owned blob on the chat message,
-// so the picture lives in the chat (with a Download link) and survives
-// reopening — fal's own URLs are never rendered directly.
+// Image generation through NVIDIA's image endpoint for the task board's
+// picture model (flux-3-image-klein). NVIDIA serves its image models
+// from the genai host; if that endpoint does not serve this model, the
+// call throws and the chat says so in one honest line — a picture is
+// never faked.
 // ---------------------------------------------------------------------------
 
-const FAL_IMAGE_MODEL = "fal-ai/flux/schnell";
-
-async function generateImageFal(apiKey: string, prompt: string): Promise<{ bytes: Uint8Array; contentType: string }> {
-  const res = await fetchWithTimeout(`https://fal.run/${FAL_IMAGE_MODEL}`, {
+async function generateImageNvidia(apiKey: string, prompt: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const res = await fetchWithTimeout(`https://ai.api.nvidia.com/v1/genai/${FLUX_KLEIN}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Key ${apiKey}` },
-    body: JSON.stringify({ prompt, image_size: "landscape_4_3", num_images: 1, output_format: "jpeg" }),
+    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ prompt, cfg_scale: 3.5, aspect_ratio: "16/9", seed: 0, steps: 50 }),
   }, 90000);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 140)}` : ""}`);
   }
-  const json = (await res.json()) as { images?: Array<{ url?: string; content_type?: string }> };
-  const img = json.images?.[0];
-  if (!img?.url) throw new Error("No image came back");
-  const imgRes = await fetchWithTimeout(img.url, { method: "GET" }, 30000);
-  if (!imgRes.ok) throw new Error(`The generated image could not be downloaded (HTTP ${imgRes.status})`);
-  const bytes = new Uint8Array(await imgRes.arrayBuffer());
-  if (bytes.length === 0) throw new Error("The generated image was empty");
-  return { bytes, contentType: img.content_type || "image/jpeg" };
+  const json = (await res.json()) as {
+    image?: string;
+    artifacts?: Array<{ base64?: string; mime_type?: string }>;
+    images?: Array<{ url?: string; content_type?: string; image?: string }>;
+  };
+  const b64 = typeof json.image === "string" && json.image ? json.image : json.artifacts?.[0]?.base64 ?? json.images?.[0]?.image;
+  if (typeof b64 === "string" && b64) {
+    return { bytes: base64ToBytes(b64), contentType: "image/jpeg" };
+  }
+  const url = json.images?.[0]?.url;
+  if (url) {
+    const imgRes = await fetchWithTimeout(url, { method: "GET" }, 30000);
+    if (!imgRes.ok) throw new Error(`The generated image could not be downloaded (HTTP ${imgRes.status})`);
+    const bytes = new Uint8Array(await imgRes.arrayBuffer());
+    if (bytes.length === 0) throw new Error("The generated image was empty");
+    return { bytes, contentType: json.images?.[0]?.content_type || "image/jpeg" };
+  }
+  throw new Error("No image came back from NVIDIA's image endpoint");
 }
 
 // Is this message asking EKAM to CREATE a picture? Needs both an image
@@ -582,13 +394,12 @@ function isImageRequest(text: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Chat attachments ("+" attach in the composer) — the personal edition's
-// proven pattern. Files are stored as blobs and kept on the message.
-// Treatment by kind: photos are looked at by a vision-capable connected
-// route, documents are read (text extracted and given to the pipeline),
-// other files are acknowledged by name. Nothing is ever faked: a photo
-// no connected route can see, and a document with no readable text, are
-// both stated plainly in the reply.
+// Chat attachments ("+" attach in the composer). Files are stored as
+// blobs and kept on the message. Treatment by kind: photos are looked
+// at by the NVIDIA vision model, documents are read (text extracted and
+// given to the pipeline), other files are acknowledged by name. Nothing
+// is ever faked: a photo the vision model could not see, and a document
+// with no readable text, are both stated plainly in the reply.
 // ---------------------------------------------------------------------------
 
 type AttachmentKind = "image" | "document" | "other";
@@ -643,165 +454,66 @@ function extractDocumentText(mimeType: string, bytes: Uint8Array): string | null
   return null;
 }
 
-// Providers that can genuinely see an image, best first, with the vision
-// model each one is called with. DeepSeek's API takes no image input, so
-// it is honestly absent — a DeepSeek-only user gets the plain sentence.
-const VISION_ROUTES: Array<{ provider: ProviderId; model: string }> = [
-  { provider: "gemini", model: "gemini-2.5-flash" },
-  { provider: "openrouter", model: "nvidia/nemotron-3.5-super-vl:free" },
-  { provider: "claude", model: "claude-sonnet-4-5" },
-  { provider: "xai", model: "grok-4-1-fast-non-reasoning" },
-  { provider: "mistral", model: "mistral-small-latest" },
-  { provider: "groq", model: "meta-llama/llama-4-scout-17b-16e-instruct" },
-  { provider: "together", model: "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo" },
-  { provider: "fireworks", model: "accounts/fireworks/models/llama-v3p2-11b-vision-instruct" },
-  { provider: "nvidia", model: "meta/llama-3.2-90b-vision-instruct" },
-  { provider: "cohere", model: "command-a-vision-07-2025" },
-  { provider: "huggingface", model: "meta-llama/Llama-3.2-11B-Vision-Instruct" },
-];
+// The vision models on the user's NVIDIA key, best first: the Super VL
+// model, then the multimodal GLM flash as fallback.
+const VISION_MODELS: string[] = [SUPER_VL, GLM_FLASH];
 
 const VISION_PROMPT = (userMessage: string) =>
   `The user attached this photo to a chat message. Their message: "${userMessage || "(no text — just the photo)"}". Describe what is in the photo and note anything relevant to what they asked, so the assistant can discuss it with them.`;
 
-async function describeImageVia(provider: ProviderId, apiKey: string, model: string, mimeType: string, dataBase64: string, userMessage: string): Promise<string> {
+async function describeImage(apiKey: string, mimeType: string, dataBase64: string, userMessage: string): Promise<string | null> {
   const prompt = VISION_PROMPT(userMessage);
-  const opts = { maxTokens: 800, temperature: 0.4, timeoutMs: 60000 };
-  if (provider === "gemini") {
-    const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: dataBase64 } }] }],
-        generationConfig: { temperature: opts.temperature, maxOutputTokens: opts.maxTokens },
-      }),
-    }, opts.timeoutMs);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-    const text = (json.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? "").join("").trim();
-    if (!text) throw new Error("Empty vision response");
-    return text;
-  }
-  if (provider === "claude") {
-    const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model,
-        max_tokens: opts.maxTokens,
-        temperature: opts.temperature,
-        messages: [{ role: "user", content: [
-          { type: "image", source: { type: "base64", media_type: mimeType, data: dataBase64 } },
-          { type: "text", text: prompt },
-        ] }],
-      }),
-    }, opts.timeoutMs);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = (await res.json()) as { content?: Array<{ type?: string; text?: string }> };
-    const text = (json.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
-    if (!text) throw new Error("Empty vision response");
-    return text;
-  }
-  if (provider === "cohere") {
-    const res = await fetchWithTimeout("https://api.cohere.com/v2/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: [
-          { type: "image", source: { type: "base64", media_type: mimeType, data: dataBase64 } },
-          { type: "text", text: prompt },
-        ] }],
-        temperature: opts.temperature,
-        max_tokens: opts.maxTokens,
-      }),
-    }, opts.timeoutMs);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = (await res.json()) as { message?: { content?: Array<{ type?: string; text?: string }> } };
-    const text = (json.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
-    if (!text) throw new Error("Empty vision response");
-    return text;
-  }
-  // OpenAI-style image part — OpenRouter, xAI, Mistral, Groq, Together,
-  // Fireworks, NVIDIA and Hugging Face all accept a data-URI image_url.
-  const urls: Partial<Record<ProviderId, string>> = {
-    openrouter: "https://openrouter.ai/api/v1/chat/completions",
-    xai: "https://api.x.ai/v1/chat/completions",
-    mistral: "https://api.mistral.ai/v1/chat/completions",
-    groq: "https://api.groq.com/openai/v1/chat/completions",
-    together: "https://api.together.xyz/v1/chat/completions",
-    fireworks: "https://api.fireworks.ai/inference/v1/chat/completions",
-    nvidia: "https://integrate.api.nvidia.com/v1/chat/completions",
-    huggingface: "https://router.huggingface.co/v1/chat/completions",
-  };
-  const url = urls[provider];
-  if (!url) throw new Error("No vision route for this provider");
-  const res = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...(provider === "openrouter" ? { "X-Title": "EKAM Public" } : {}) },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:${mimeType};base64,${dataBase64}` } },
-      ] }],
-      temperature: opts.temperature,
-      max_tokens: opts.maxTokens,
-    }),
-  }, opts.timeoutMs);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = (await res.json()) as OaiChatResponse;
-  const text = extractOaiText(json);
-  if (!text) throw new Error("Empty vision response");
-  return text;
-}
-
-// Look at a photo through the user's connected vision routes, best
-// first. Returns the description, or null when no connected route could
-// see it — the caller states that honestly rather than faking sight.
-async function describeImage(conns: Map<ProviderId, { apiKey: string; last4: string }>, mimeType: string, dataBase64: string, userMessage: string): Promise<{ text: string; provider: ProviderId } | null> {
-  for (const route of VISION_ROUTES) {
-    const conn = conns.get(route.provider);
-    if (!conn) continue;
+  for (const model of VISION_MODELS) {
     try {
-      const text = await describeImageVia(route.provider, conn.apiKey, route.model, mimeType, dataBase64, userMessage);
-      return { text, provider: route.provider };
+      const res = await fetchWithTimeout(NVIDIA_CHAT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${dataBase64}` } },
+          ] }],
+          temperature: 0.4,
+          max_tokens: 800,
+        }),
+      }, 60000);
+      if (!res.ok) continue;
+      const json = (await res.json()) as OaiChatResponse;
+      const text = extractOaiText(json);
+      if (text) return text;
     } catch {
-      // fall through to the next connected vision route
+      // fall through to the next vision model
     }
   }
   return null;
 }
 
-function anyVisionRouteConnected(conns: Map<ProviderId, unknown>): boolean {
-  return VISION_ROUTES.some((r) => conns.has(r.provider));
-}
+type CallOutcome = { text: string; model: string; latencyMs: number };
 
-type CallOutcome = { text: string; provider: ProviderId; latencyMs: number };
-
-// Try the capability's providers that the user has connected, reordered
-// by the user's learning record (proven routes first: successes, then
-// failures avoided, then speed). Providers never connected are absent.
+// Try the capability's NVIDIA models in order, re-ordered by the user's
+// learning record (proven models first: successes, then failures
+// avoided, then speed).
 async function callWithLearning(
   ctx: Ctx,
   userId: number,
-  conns: Map<ProviderId, { apiKey: string; last4: string }>,
+  conn: NvidiaConn,
   cap: Capability,
   system: string,
   user: string,
   opts: { maxTokens: number; temperature: number; timeoutMs: number },
 ): Promise<CallOutcome> {
   const db = ctx.db<typeof schema>();
-  const candidates = cap.providers.filter((p) => conns.has(p));
-  if (candidates.length === 0) throw new Error("No connected provider can serve this part");
+  if (cap.models.length === 0) throw new Error("No NVIDIA model can serve this part");
   const stats = await db
     .select()
     .from(schema.learningStats)
     .where(and(eq(schema.learningStats.userId, userId), eq(schema.learningStats.capabilityKey, cap.key)));
-  const statByProvider = new Map(stats.map((s) => [s.routeClass, s]));
-  const scored = candidates.map((provider, idx) => {
-    const s = statByProvider.get(provider);
+  const statByModel = new Map(stats.map((s) => [s.routeClass, s]));
+  const scored = cap.models.map((model, idx) => {
+    const s = statByModel.get(model);
     return {
-      provider,
+      model,
       idx,
       done: s?.done ?? 0,
       failed: s?.failed ?? 0,
@@ -819,21 +531,21 @@ async function callWithLearning(
   for (const attempt of scored) {
     const started = Date.now();
     try {
-      const text = await callProvider(attempt.provider, conns.get(attempt.provider)!.apiKey, cap, system, user, opts);
-      return { text, provider: attempt.provider, latencyMs: Date.now() - started };
+      const text = await callNvidiaChat(conn.apiKey, attempt.model, system, user, opts);
+      return { text, model: attempt.model, latencyMs: Date.now() - started };
     } catch (e) {
-      errors.push(`${ROUTE_LABELS[attempt.provider]}: ${e instanceof Error ? e.message : String(e)}`);
+      errors.push(`${routeLabelFor(attempt.model)}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   throw new Error(errors.join(" · ").slice(0, 400));
 }
 
-async function recordLearning(ctx: Ctx, userId: number, capabilityKey: string, provider: ProviderId, ok: boolean, latencyMs: number): Promise<void> {
+async function recordLearning(ctx: Ctx, userId: number, capabilityKey: string, model: string, ok: boolean, latencyMs: number): Promise<void> {
   const db = ctx.db<typeof schema>();
   const rows = await db
     .select()
     .from(schema.learningStats)
-    .where(and(eq(schema.learningStats.userId, userId), eq(schema.learningStats.capabilityKey, capabilityKey), eq(schema.learningStats.routeClass, provider)))
+    .where(and(eq(schema.learningStats.userId, userId), eq(schema.learningStats.capabilityKey, capabilityKey), eq(schema.learningStats.routeClass, model)))
     .limit(1);
   const existing = rows[0];
   if (existing) {
@@ -850,7 +562,7 @@ async function recordLearning(ctx: Ctx, userId: number, capabilityKey: string, p
     await db.insert(schema.learningStats).values({
       userId,
       capabilityKey,
-      routeClass: provider,
+      routeClass: model,
       sent: 1,
       done: ok ? 1 : 0,
       failed: ok ? 0 : 1,
@@ -935,7 +647,7 @@ function fastPathPlan(task: string, allowedKeys: string[]): Plan | null {
     }
   }
   // A short, plainly single ask: one everyday answer, straight from the
-  // best connected seat for everyday questions.
+  // fast seat for everyday questions.
   if (t.length <= 140 && !/\b(and also|as well as|plus a|build|create|design|develop|website|app|plan for)\b/.test(lower)) {
     const capKey = allowedKeys.includes("general") ? "general" : null;
     if (capKey) return { goal: t, parts: [{ capability: capKey, title: "Answer", instruction: t }] };
@@ -945,34 +657,34 @@ function fastPathPlan(task: string, allowedKeys: string[]): Plan | null {
 
 const DIVIDER_CAP: Capability = CAP_BY_KEY.get("planning") ?? CAPABILITIES[0]!;
 
-async function divideTask(ctx: Ctx, userId: number, conns: Map<ProviderId, { apiKey: string; last4: string }>, task: string, settings: AdjustSettings): Promise<{ plan: Plan; note: string }> {
+async function divideTask(ctx: Ctx, userId: number, conn: NvidiaConn, task: string, settings: AdjustSettings): Promise<{ plan: Plan; note: string }> {
   const allowedKeys = settings.seats;
   const cap = partCapFor(settings);
   const budgets = budgetsFor(settings);
   const system = dividerSystem(allowedKeys, cap);
 
   const fast = fastPathPlan(task, allowedKeys);
-  if (fast) return { plan: fast, note: "Simple message — answered directly by the best connected seat, no division needed." };
+  if (fast) return { plan: fast, note: "Simple message — answered directly by the best seat, no division needed." };
 
-  const first = await callWithLearning(ctx, userId, conns, DIVIDER_CAP, system, `Task to divide:\n\n${task}`, {
+  const first = await callWithLearning(ctx, userId, conn, DIVIDER_CAP, system, `Task to divide:\n\n${task}`, {
     maxTokens: budgets.dividerTokens,
     temperature: 0.3,
     timeoutMs: 30000,
   });
   const plan = parsePlanText(first.text, allowedKeys, cap);
-  if (plan) return { plan, note: `Divided by the Divider AI via ${ROUTE_LABELS[first.provider]} in ${(first.latencyMs / 1000).toFixed(1)}s.` };
+  if (plan) return { plan, note: `Divided by the Divider AI via ${routeLabelFor(first.model)} in ${(first.latencyMs / 1000).toFixed(1)}s.` };
 
   const repair = await callWithLearning(
     ctx,
     userId,
-    conns,
+    conn,
     DIVIDER_CAP,
     system,
     `Task to divide:\n\n${task}\n\nYour previous answer was not valid — it may have used a capability that is switched off, or more parts than allowed. Answer again with ONLY the JSON object in the exact contract: {"goal": "...", "parts": [{"capability": "<one of: ${allowedKeys.join(", ")}>", "title": "...", "instruction": "..."}]} with 1-${cap} parts.`,
     { maxTokens: budgets.dividerTokens, temperature: 0.2, timeoutMs: 30000 },
   );
   const repaired = parsePlanText(repair.text, allowedKeys, cap);
-  if (repaired) return { plan: repaired, note: `Divided by the Divider AI via ${ROUTE_LABELS[repair.provider]} in ${(repair.latencyMs / 1000).toFixed(1)}s (plan repaired once by the validator).` };
+  if (repaired) return { plan: repaired, note: `Divided by the Divider AI via ${routeLabelFor(repair.model)} in ${(repair.latencyMs / 1000).toFixed(1)}s (plan repaired once by the validator).` };
 
   const fallbackKey = allowedKeys.includes("general") ? "general" : allowedKeys[0]!;
   return {
@@ -983,19 +695,19 @@ async function divideTask(ctx: Ctx, userId: number, conns: Map<ProviderId, { api
 
 const COMBINE_SYSTEM = `You are the Divider of EKAM, finishing a job you divided. Specialists have each completed one part of the task. Weave their parts into ONE final result for the user: complete, well-structured, no part boundaries showing, no mention of parts, specialists, routes or process. If a part failed, work gracefully with what exists and do not invent what is missing.`;
 
-async function combineParts(ctx: Ctx, userId: number, conns: Map<ProviderId, { apiKey: string; last4: string }>, task: string, plan: Plan, parts: Array<{ capabilityLabel: string; title: string; output: string | null }>, settings: AdjustSettings): Promise<{ text: string; note: string }> {
+async function combineParts(ctx: Ctx, userId: number, conn: NvidiaConn, task: string, plan: Plan, parts: Array<{ capabilityLabel: string; title: string; output: string | null }>, settings: AdjustSettings): Promise<{ text: string; note: string }> {
   const done = parts.filter((p) => p.output);
   if (done.length === 1 && parts.length === 1) {
     return { text: done[0]!.output!, note: "Single part — the specialist's answer is the reply, no combine needed." };
   }
   const budgets = budgetsFor(settings);
   const user = `Original task:\n${task}\n\nGoal: ${plan.goal}\n\nParts brought back:\n\n${done.map((p, i) => `--- Part ${i + 1} (${p.capabilityLabel}: ${p.title}) ---\n${p.output}`).join("\n\n")}\n\n${thinkingNote(settings.thinking)}\n${lengthNote(settings.length)}\n\nWrite the one final result.`;
-  const res = await callWithLearning(ctx, userId, conns, DIVIDER_CAP, COMBINE_SYSTEM, user, {
+  const res = await callWithLearning(ctx, userId, conn, DIVIDER_CAP, COMBINE_SYSTEM, user, {
     maxTokens: budgets.combineTokens,
     temperature: 0.5,
     timeoutMs: 60000,
   });
-  return { text: res.text, note: `Combined by the Divider AI via ${ROUTE_LABELS[res.provider]} in ${(res.latencyMs / 1000).toFixed(1)}s.` };
+  return { text: res.text, note: `Combined by the Divider AI via ${routeLabelFor(res.model)} in ${(res.latencyMs / 1000).toFixed(1)}s.` };
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,17 +717,17 @@ async function combineParts(ctx: Ctx, userId: number, conns: Map<ProviderId, { a
 const teamSeat = z.object({
   key: z.string(),
   label: z.string(),
-  servedBy: z.enum(["connection", "platform", "fal"]),
+  servedBy: z.enum(["connection", "platform", "image"]),
   state: z.enum(["connected", "platform_soon", "not_connected"]),
 });
 
-const providerSlot = z.object({
-  provider: z.string(),
-  name: z.string(),
-  keyUrl: z.string(),
-  keyHint: z.string(),
-  purpose: z.enum(["chat", "image"]),
-  note: z.string().nullable(),
+const taskSectionShape = z.object({
+  id: z.string(),
+  task: z.string(),
+  model: z.string(),
+  modelUrl: z.string(),
+  group: z.enum(["core", "more"]),
+  blurb: z.string(),
   connected: z.boolean(),
   last4: z.string().nullable(),
 });
@@ -1025,7 +737,7 @@ const meResponse = z.object({
   user: z.object({ name: z.string(), email: z.string() }).nullable(),
   connected: z.boolean(),
   connectedCount: z.number(),
-  providers: z.array(providerSlot),
+  tasks: z.array(taskSectionShape),
   team: z.array(teamSeat),
 });
 
@@ -1066,32 +778,32 @@ const runShape = z.object({
 
 type MeOut = z.infer<typeof meResponse>;
 
-function providerSlots(conns: Map<ProviderId, { apiKey: string; last4: string }>): z.infer<typeof providerSlot>[] {
-  return PROVIDERS.map((p) => ({
-    provider: p.id,
-    name: p.name,
-    keyUrl: p.keyUrl,
-    keyHint: p.keyHint,
-    purpose: p.purpose === "image" ? ("image" as const) : ("chat" as const),
-    note: p.note ?? null,
-    connected: conns.has(p.id),
-    last4: conns.get(p.id)?.last4 ?? null,
+function taskSections(conn: NvidiaConn | null): z.infer<typeof taskSectionShape>[] {
+  return TASK_BOARD.map((t) => ({
+    id: t.id,
+    task: t.task,
+    model: t.model,
+    modelUrl: t.modelUrl,
+    group: t.group,
+    blurb: t.blurb,
+    connected: conn != null,
+    last4: conn?.last4 ?? null,
   }));
 }
 
 async function buildMe(ctx: Ctx, user: { id: number; name: string; email: string } | null): Promise<MeOut> {
-  const conns = user ? await connectionsFor(ctx, user.id) : new Map<ProviderId, { apiKey: string; last4: string }>();
+  const conn = user ? await nvidiaConnFor(ctx, user.id) : null;
   return {
     signedIn: !!user,
     user: user ? { name: user.name, email: user.email } : null,
-    connected: conns.size > 0,
-    connectedCount: conns.size,
-    providers: providerSlots(conns),
+    connected: conn != null,
+    connectedCount: conn != null ? 1 : 0,
+    tasks: taskSections(conn),
     team: CAPABILITIES.map((c) => ({
       key: c.key,
       label: c.label,
       servedBy: c.servedBy,
-      state: c.servedBy === "platform" ? ("platform_soon" as const) : seatServable(c, conns) ? ("connected" as const) : ("not_connected" as const),
+      state: c.servedBy === "platform" ? ("platform_soon" as const) : seatServable(c, conn != null) ? ("connected" as const) : ("not_connected" as const),
     })),
   };
 }
@@ -1101,7 +813,7 @@ const adjustResponse = z.object({
     z.object({
       key: z.string(),
       label: z.string(),
-      servedBy: z.enum(["connection", "platform", "fal"]),
+      servedBy: z.enum(["connection", "platform", "image"]),
       state: z.enum(["connected", "platform_soon", "not_connected"]),
       on: z.boolean(),
     }),
@@ -1114,21 +826,21 @@ const adjustResponse = z.object({
 type AdjustOut = z.infer<typeof adjustResponse>;
 
 async function buildAdjust(ctx: Ctx, user: { id: number }): Promise<AdjustOut> {
-  const conns = await connectionsFor(ctx, user.id);
+  const conn = await nvidiaConnFor(ctx, user.id);
   const settings = await loadAdjust(ctx, user.id);
   const onSet = new Set(settings.seats);
   return {
     seats: CAPABILITIES.map((c) => {
-      const servable = seatServable(c, conns);
+      const servable = seatServable(c, conn != null);
       return {
         key: c.key,
         label: c.label,
         servedBy: c.servedBy,
         state: c.servedBy === "platform" ? ("platform_soon" as const) : servable ? ("connected" as const) : ("not_connected" as const),
-        // A seat whose provider is not connected can never be on. The
+        // A seat cannot be on while the NVIDIA key is not connected. The
         // image seat is not a divider toggle — it is simply available
-        // while fal is connected, so its "on" mirrors availability.
-        on: c.servedBy === "fal" ? servable : servable && onSet.has(c.key),
+        // while the key is connected, so its "on" mirrors availability.
+        on: c.servedBy === "image" ? servable : servable && onSet.has(c.key),
       };
     }),
     howMany: settings.howMany,
@@ -1243,77 +955,74 @@ export const Actions = {
     },
   }),
 
-  // --- Developer setup: the per-user key room ------------------------------
-  // Each slot: paste a key the user created on that provider's own site.
-  // The server makes ONE real test call with it; the key is stored ONLY
-  // if the provider accepts it. A refusal stores nothing.
+  // --- Developer setup: the NVIDIA task board ----------------------------
+  // One key rules them all: the visitor's single NVIDIA key. Every task
+  // section shows the same paste blank; saving in ANY section makes ONE
+  // real test call to the NVIDIA API and stores the key once, against
+  // the user's account, ONLY if NVIDIA accepts it. A refusal stores
+  // nothing. Disconnect removes the one key.
 
   getDeveloperSetup: defineAction({
     request: z.object({ token: z.string().min(1).max(200) }),
-    response: z.object({ providers: z.array(providerSlot), connectedCount: z.number() }),
+    response: z.object({ tasks: z.array(taskSectionShape), connected: z.boolean(), last4: z.string().nullable() }),
     async handler(ctx, args) {
       const user = await userForToken(ctx, args.token);
-      if (!user) return { providers: providerSlots(new Map()), connectedCount: 0 };
-      const conns = await connectionsFor(ctx, user.id);
-      return { providers: providerSlots(conns), connectedCount: conns.size };
+      if (!user) return { tasks: taskSections(null), connected: false, last4: null };
+      const conn = await nvidiaConnFor(ctx, user.id);
+      return { tasks: taskSections(conn), connected: conn != null, last4: conn?.last4 ?? null };
     },
   }),
 
-  saveProviderKey: defineAction({
-    request: z.object({ token: z.string().min(1).max(200), provider: z.enum(["openrouter", "nvidia", "groq", "gemini", "claude", "mistral", "cohere", "together", "fireworks", "deepseek", "xai", "huggingface", "fal"]), apiKey: z.string().max(500) }),
+  saveNvidiaKey: defineAction({
+    request: z.object({ token: z.string().min(1).max(200), apiKey: z.string().max(500) }),
     response: z.object({ ok: z.boolean(), last4: z.string().nullable(), message: z.string() }),
     async handler(ctx, args) {
       const user = await userForToken(ctx, args.token);
       if (!user) return { ok: false, last4: null, message: "Please sign in first, then paste your key." };
-      const def = PROVIDER_BY_ID.get(args.provider)!;
       const apiKey = args.apiKey.trim();
       if (!apiKey) {
-        return { ok: false, last4: null, message: `The blank is empty — paste your ${def.name} key in first, then tap Save.` };
+        return { ok: false, last4: null, message: "The blank is empty — paste your NVIDIA key in first, then tap Save." };
       }
       if (/\s/.test(apiKey) || apiKey.length < 10) {
-        return { ok: false, last4: null, message: `That doesn't look like a ${def.name} key — keys are one long unbroken string. Copy the whole key on ${def.name}'s page and paste it again.` };
-      }
-      if (args.provider === "openrouter" && !apiKey.startsWith("sk-or-")) {
-        return { ok: false, last4: null, message: "That doesn't look like an OpenRouter key — real keys begin with “sk-or-”. Copy the whole key on OpenRouter's page and paste it again." };
+        return { ok: false, last4: null, message: "That doesn't look like an NVIDIA key — keys are one long unbroken string. Copy the whole key from build.nvidia.com and paste it again." };
       }
       let res: Response;
       try {
-        res = await testProviderKey(args.provider, apiKey);
+        res = await testNvidiaKey(apiKey);
       } catch (e) {
-        return { ok: false, last4: null, message: `Could not reach ${def.name} to test your key: ${e instanceof Error ? e.message.slice(0, 160) : "network error"}. Nothing was saved — try again.` };
+        return { ok: false, last4: null, message: `Could not reach NVIDIA to test your key: ${e instanceof Error ? e.message.slice(0, 160) : "network error"}. Nothing was saved — try again.` };
       }
       if (!res.ok) {
         await res.text().catch(() => "");
-        return { ok: false, last4: null, message: `${def.name} didn't accept this key — check you copied the whole key and try again.` };
+        return { ok: false, last4: null, message: "NVIDIA didn't accept this key — check you copied the whole key and try again." };
       }
       const db = ctx.db<typeof schema>();
       const last4 = apiKey.slice(-4);
       const existing = await db
         .select()
         .from(schema.connections)
-        .where(and(eq(schema.connections.userId, user.id), eq(schema.connections.provider, args.provider)))
+        .where(and(eq(schema.connections.userId, user.id), eq(schema.connections.provider, "nvidia")))
         .limit(1);
       if (existing[0]) {
         await db.update(schema.connections).set({ apiKey, last4 }).where(eq(schema.connections.id, existing[0].id));
       } else {
-        await db.insert(schema.connections).values({ userId: user.id, provider: args.provider, apiKey, last4 });
+        await db.insert(schema.connections).values({ userId: user.id, provider: "nvidia", apiKey, last4 });
       }
       ctx.invalidateQueries();
-      return { ok: true, last4, message: `Connected — your ${def.name} key passed a live test and is stored safely on the server (only ····${last4} is ever shown).` };
+      return { ok: true, last4, message: `Connected — your NVIDIA key passed a live test and is stored safely on the server (only ····${last4} is ever shown). One key unlocks every section on this board.` };
     },
   }),
 
-  disconnectProvider: defineAction({
-    request: z.object({ token: z.string().min(1).max(200), provider: z.enum(["openrouter", "nvidia", "groq", "gemini", "claude", "mistral", "cohere", "together", "fireworks", "deepseek", "xai", "huggingface", "fal"]) }),
+  disconnectNvidia: defineAction({
+    request: z.object({ token: z.string().min(1).max(200) }),
     response: z.object({ ok: z.boolean(), message: z.string() }),
     async handler(ctx, args) {
       const user = await userForToken(ctx, args.token);
       if (!user) return { ok: false, message: "Please sign in first." };
-      const def = PROVIDER_BY_ID.get(args.provider)!;
       const db = ctx.db<typeof schema>();
-      await db.delete(schema.connections).where(and(eq(schema.connections.userId, user.id), eq(schema.connections.provider, args.provider)));
+      await db.delete(schema.connections).where(and(eq(schema.connections.userId, user.id), eq(schema.connections.provider, "nvidia")));
       ctx.invalidateQueries();
-      return { ok: true, message: `Disconnected — your ${def.name} key was removed from EKAM's server. (The key itself still exists on your ${def.name} account; you can revoke it there any time.)` };
+      return { ok: true, message: "Disconnected — your NVIDIA key was removed from EKAM's server. (The key itself still exists on your NVIDIA account; you can revoke it there any time.)" };
     },
   }),
 
@@ -1354,15 +1063,15 @@ export const Actions = {
     async handler(ctx, args) {
       const user = await userForToken(ctx, args.token);
       if (!user) return { ok: false, message: "Please sign in first.", adjust: null };
-      const conns = await connectionsFor(ctx, user.id);
+      const conn = await nvidiaConnFor(ctx, user.id);
       const settings = normalizeAdjust({ seats: args.seats, howMany: args.howMany, thinking: args.thinking, length: args.length });
-      // A seat whose provider is not connected cannot be switched on —
-      // enforce it here too, not just in the panel.
+      // A seat cannot be switched on while the NVIDIA key is not
+      // connected — enforce it here too, not just in the panel.
       settings.seats = settings.seats.filter((k) => {
         const cap = CAP_BY_KEY.get(k);
-        return cap ? seatServable(cap, conns) : false;
+        return cap ? seatServable(cap, conn != null) : false;
       });
-      if (settings.seats.length === 0 && conns.size > 0) {
+      if (settings.seats.length === 0 && conn != null) {
         return { ok: false, message: "At least one seat must stay on — a reply needs at least one specialist.", adjust: null };
       }
       await saveAdjustRow(ctx, user.id, settings);
@@ -1500,9 +1209,9 @@ export const Actions = {
       if (!args.content && incomingAtts.length === 0) {
         return { ok: false, chatId: args.chatId, message: "Write a message or attach a file first." };
       }
-      const conns = await connectionsFor(ctx, user.id);
-      if (conns.size === 0) {
-        return { ok: false, chatId: args.chatId, message: "Add a key in Developer setup and EKAM is ready to work." };
+      const conn = await nvidiaConnFor(ctx, user.id);
+      if (!conn) {
+        return { ok: false, chatId: args.chatId, message: "Add your NVIDIA key in Developer setup and EKAM is ready to work." };
       }
       const db = ctx.db<typeof schema>();
       const titleSource = args.content || incomingAtts[0]?.fileName || "New chat";
@@ -1531,23 +1240,15 @@ export const Actions = {
       const userMessageId = userMsgIns[0]!.id;
       ctx.invalidateQueries();
 
-      // Image asks take their own road — straight to the user's fal
-      // connection, never through the text divider. Only when the
-      // message carries no attachments (an attached photo means the
-      // user is asking ABOUT a picture, not for a new one).
+      // Image asks take their own road — straight to NVIDIA's image
+      // endpoint for the task board's picture model, never through the
+      // text divider. Only when the message carries no attachments (an
+      // attached photo means the user is asking ABOUT a picture, not
+      // for a new one). If NVIDIA's image endpoint does not serve the
+      // model, the reply says so in one honest line — no picture faked.
       if (incomingAtts.length === 0 && isImageRequest(args.content)) {
-        const falConn = conns.get("fal");
-        if (!falConn) {
-          await db.insert(schema.chatMessages).values({
-            chatId,
-            role: "assistant",
-            content: "I can't make images yet — image generation needs fal.ai connected. Open Developer setup, paste your key in the fal.ai slot (the one marked “For image generation”), and once it shows Connected, ask me again and your picture will appear right here.",
-          });
-          ctx.invalidateQueries();
-          return { ok: true, chatId, message: "Image generation isn't connected yet — the reply in the chat explains how to connect it." };
-        }
         try {
-          const { bytes, contentType } = await generateImageFal(falConn.apiKey, args.content);
+          const { bytes, contentType } = await generateImageNvidia(conn.apiKey, args.content);
           const ext = contentType.includes("png") ? "png" : "jpg";
           const replyIns = await db
             .insert(schema.chatMessages)
@@ -1573,7 +1274,7 @@ export const Actions = {
           await db.insert(schema.chatMessages).values({
             chatId,
             role: "assistant",
-            content: "I couldn't make that picture just now — fal didn't complete the generation (this usually means the fal account is out of credit, or fal hit an error), and no image was made.",
+            content: "I couldn't make that picture just now — NVIDIA's image endpoint didn't serve the picture model, and no image was made. Everything else in EKAM still runs on your NVIDIA key as usual.",
           });
           ctx.invalidateQueries();
           return { ok: true, chatId, message: "Image generation didn't go through — the reply in the chat says so honestly." };
@@ -1582,15 +1283,13 @@ export const Actions = {
 
       // Attachments: store the bytes as blobs with a metadata row on the
       // message, and build the context the pipeline works from — photos
-      // looked at by a connected vision route, documents read, other
+      // looked at by the NVIDIA vision model, documents read, other
       // files acknowledged by name. Anything that could not be read or
-      // seen earns one honest sentence appended to the reply itself, so
-      // it is never left to chance.
+      // seen earns one honest sentence appended to the reply itself.
       let attachmentContext = "";
       const honestNotes: string[] = [];
       if (incomingAtts.length > 0) {
         const contextParts: string[] = [];
-        const visionAvailable = anyVisionRouteConnected(conns);
         for (const att of incomingAtts) {
           const bytes = base64ToBytes(att.dataBase64);
           const kind = attachmentKindOf(att.mimeType, att.fileName);
@@ -1600,16 +1299,13 @@ export const Actions = {
           let extractedText: string | null = null;
           if (kind === "image") {
             if (att.mimeType === "image/jpeg" || att.mimeType === "image/png" || att.mimeType === "image/webp") {
-              const seen = visionAvailable ? await describeImage(conns, att.mimeType, att.dataBase64, args.content) : null;
+              const seen = await describeImage(conn.apiKey, att.mimeType, att.dataBase64, args.content);
               if (seen) {
-                extractedText = seen.text;
-                contextParts.push(`[Attached photo "${att.fileName}" — this is what it shows: ${seen.text}]`);
-              } else if (visionAvailable) {
-                contextParts.push(`[Attached photo "${att.fileName}" — it is saved with this message, but the vision route could not view it just now; be honest about that if asked about its contents.]`);
-                honestNotes.push(`I couldn't view the photo “${att.fileName}” just now — the vision route didn't answer. It is saved with your message.`);
+                extractedText = seen;
+                contextParts.push(`[Attached photo "${att.fileName}" — this is what it shows: ${seen}]`);
               } else {
-                contextParts.push(`[Attached photo "${att.fileName}" — it is saved with this message, but none of the user's connected providers can read images, so you cannot see it. Do not guess or invent what it shows.]`);
-                honestNotes.push(`I can't look at the photo “${att.fileName}” — none of the providers you've connected can read images. Connect Gemini, OpenRouter, Claude or xAI (Grok) in Developer setup and I'll be able to see photos.`);
+                contextParts.push(`[Attached photo "${att.fileName}" — it is saved with this message, but the vision model could not view it just now; be honest about that if asked about its contents.]`);
+                honestNotes.push(`I couldn't view the photo “${att.fileName}” just now — the vision model didn't answer. It is saved with your message.`);
               }
             } else {
               contextParts.push(`[Attached photo "${att.fileName}" — saved with this message; this image type can't be viewed in EKAM.]`);
@@ -1645,20 +1341,20 @@ export const Actions = {
         ? `${args.content || "Please look at what I attached and answer from it."}\n\nMaterial the user attached to this message — treat it as source material for dividing and doing the work:\n${attachmentContext}`
         : args.content;
 
-      // Adjust governs this reply; only seats a connected provider can
-      // serve may work.
+      // Adjust governs this reply; only seats the NVIDIA key can serve
+      // may work (all of them, while the key is connected).
       const loaded = await loadAdjust(ctx, user.id);
       const settings: AdjustSettings = {
         ...loaded,
         seats: loaded.seats.filter((k) => {
           const cap = CAP_BY_KEY.get(k);
-          return cap ? seatServable(cap, conns) : false;
+          return cap ? seatServable(cap, true) : false;
         }),
       };
       if (settings.seats.length === 0) {
         settings.seats = DIVIDER_KEYS.filter((k) => {
           const cap = CAP_BY_KEY.get(k);
-          return cap ? seatServable(cap, conns) : false;
+          return cap ? seatServable(cap, true) : false;
         });
       }
       const budgets = budgetsFor(settings);
@@ -1681,7 +1377,7 @@ export const Actions = {
       try {
         // 1. Divide (or answer directly, on the fast path). The engine
         //    sees the attachment context as source material.
-        const { plan, note } = await divideTask(ctx, user.id, conns, taskForEngine, settings);
+        const { plan, note } = await divideTask(ctx, user.id, conn, taskForEngine, settings);
         await db
           .update(schema.runs)
           .set({ goal: plan.goal, planJson: JSON.stringify(plan), dividerNote: `${note} ${settingsSummaryLine(settings)}` })
@@ -1698,27 +1394,27 @@ export const Actions = {
           partRows.push({ id: r[0]!.id, cap, part });
         }
 
-        // 2. Dispatch in parallel across the connected providers — each
+        // 2. Dispatch in parallel across the seat models — each
         //    specialist sees only the goal line and its own instruction.
         const results = await Promise.all(
           partRows.map(async ({ id, cap, part }) => {
             const userMsg = `Goal: ${plan.goal}\n\nYour part: ${part.instruction}${attachmentContext ? `\n\nMaterial the user attached to this message (read by the system from their files — use what applies to your part):\n${attachmentContext.slice(0, 6000)}` : ""}\n\n${thinkingNote(settings.thinking)}\n${lengthNote(settings.length)}`;
             try {
-              const out = await callWithLearning(ctx, user.id, conns, cap, cap.system, userMsg, {
+              const out = await callWithLearning(ctx, user.id, conn, cap, cap.system, userMsg, {
                 maxTokens: budgets.partTokens,
                 temperature: budgets.temperature,
                 timeoutMs: 45000,
               });
-              await recordLearning(ctx, user.id, cap.key, out.provider, true, out.latencyMs);
+              await recordLearning(ctx, user.id, cap.key, out.model, true, out.latencyMs);
               await db
                 .update(schema.runParts)
-                .set({ status: "done", output: out.text, routeLabel: ROUTE_LABELS[out.provider], latencyMs: out.latencyMs })
+                .set({ status: "done", output: out.text, routeLabel: routeLabelFor(out.model), latencyMs: out.latencyMs })
                 .where(eq(schema.runParts.id, id));
               return { capabilityLabel: cap.label, title: part.title, output: out.text as string | null };
             } catch (e) {
               const msg = e instanceof Error ? e.message.slice(0, 300) : "failed";
-              const firstProvider = cap.providers.find((p) => conns.has(p));
-              if (firstProvider) await recordLearning(ctx, user.id, cap.key, firstProvider, false, 0);
+              const firstModel = cap.models[0];
+              if (firstModel) await recordLearning(ctx, user.id, cap.key, firstModel, false, 0);
               await db.update(schema.runParts).set({ status: "failed", errorNote: msg }).where(eq(schema.runParts.id, id));
               return { capabilityLabel: cap.label, title: part.title, output: null as string | null };
             }
@@ -1728,15 +1424,15 @@ export const Actions = {
         const doneCount = results.filter((r) => r.output).length;
         if (doneCount === 0) {
           return failReply(
-            "I couldn't get an answer this time — every connected route failed. Check in Developer setup that your key is still accepted, then try again.",
-            "Every specialist call failed through your connected providers.",
+            "I couldn't get an answer this time — every NVIDIA route failed. Check in Developer setup that your key is still accepted, then try again.",
+            "Every specialist call failed through your NVIDIA key.",
           );
         }
 
         // 3. Auto-combine into one reply. Any honest attachment notes
         //    (an unseen photo, an unreadable document) are appended to
         //    the reply itself — stated, never hidden.
-        const combined = await combineParts(ctx, user.id, conns, taskForEngine, plan, results, settings);
+        const combined = await combineParts(ctx, user.id, conn, taskForEngine, plan, results, settings);
         const replyText = honestNotes.length > 0 ? `${combined.text}\n\n${honestNotes.join("\n")}` : combined.text;
         await db
           .update(schema.runs)
@@ -1786,15 +1482,20 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.learningStats).where(eq(schema.learningStats.userId, user.id)).orderBy(asc(schema.learningStats.capabilityKey));
       return {
-        stats: rows.map((r) => ({
-          capabilityKey: r.capabilityKey,
-          capabilityLabel: CAP_BY_KEY.get(r.capabilityKey)?.label ?? r.capabilityKey,
-          routeLabel: PROVIDER_BY_ID.get(r.routeClass as ProviderId)?.routeLabel ?? r.routeClass,
-          sent: r.sent,
-          done: r.done,
-          failed: r.failed,
-          typicalMs: r.done > 0 ? Math.round(r.totalLatencyMs / r.done) : null,
-        })),
+        stats: rows
+          // Rows earned under the old multi-provider engine name their
+          // old providers in routeClass — those are inert history from
+          // before the NVIDIA-only rebuild and are not shown.
+          .filter((r) => r.routeClass.includes("/"))
+          .map((r) => ({
+            capabilityKey: r.capabilityKey,
+            capabilityLabel: CAP_BY_KEY.get(r.capabilityKey)?.label ?? r.capabilityKey,
+            routeLabel: routeLabelFor(r.routeClass),
+            sent: r.sent,
+            done: r.done,
+            failed: r.failed,
+            typicalMs: r.done > 0 ? Math.round(r.totalLatencyMs / r.done) : null,
+          })),
       };
     },
   }),
