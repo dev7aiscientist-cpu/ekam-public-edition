@@ -12,10 +12,11 @@ Nothing was rewritten or faked. Before this guide was written, the package was *
 
 - ✅ All 5 database migrations applied on a fresh start
 - ✅ A test account signed up through the package's own server
-- ✅ A **fake Groq key was refused by Groq itself** — *"Groq didn't accept this key"* — proving the test-call path works outside Muse
-- ✅ Chat with no keys answered honestly: *"Add a key in Developer setup and EKAM is ready to work."*
+- ✅ A **fake NVIDIA key was refused by NVIDIA itself** — *"NVIDIA didn't accept this key"* — proving the test-call path works outside Muse
+- ✅ Developer setup served through the package showed all **24 NVIDIA task sections**, Kimi K3 in the Reasoning flagship slot
+- ✅ Chat with no key answered honestly: *"Add your NVIDIA key in Developer setup and EKAM is ready to work."*
 
-**The zip contains NO database, NO accounts and NO API keys.** It starts empty, exactly like a fresh EKAM should. Every visitor creates their own account and pastes **their own** keys in Developer setup. There is no master key and no founder backdoor — by design.
+**The zip contains NO database, NO accounts and NO API keys.** It starts empty, exactly like a fresh EKAM should. Every visitor creates their own account and pastes **their own NVIDIA key** in Developer setup. There is no master key and no founder backdoor — by design.
 
 ---
 
@@ -48,6 +49,10 @@ ekam-public-edition/
 ---
 
 ## Quick start (see it run in 2 minutes)
+
+**On your own computer — just click:** unzip the package, open the `ekam-public-edition` folder, and double-click **START.bat** (Windows) or run **start.sh** (Mac/Linux). The first click installs EKAM's parts (one-time, needs internet); then EKAM starts and **your browser opens by itself** at the right address. Keep the black window open — it is EKAM's engine; close it to stop EKAM. If Bun isn't installed yet, the launcher says so in plain words and opens bun.sh for you — install Bun, double-click START again, done.
+
+**On a server — the commands:**
 
 ```bash
 unzip ekam-public-edition-deploy.zip
@@ -113,7 +118,7 @@ EKAM's whole world — **every visitor account, every pasted API key, every chat
 1. Open your EKAM URL → **Try EKAM** → create **your** account (the founder is simply the first visitor — there is no separate admin panel).
 2. **Developer setup** → paste one of your own keys → confirm it shows **Connected**.
 3. Send one small chat message. Your EKAM, on your server, answered through your key. That's the full proof, in your hands.
-4. Share the link. Visitors sign up, bring their own keys, and EKAM works for them exactly as it works for you — each person's keys, chats and learning stay theirs alone.
+4. Share the link. Visitors sign up, bring their own NVIDIA key, and EKAM works for them exactly as it works for you — each person's key, chats and learning stay theirs alone.
 
 ---
 
@@ -126,7 +131,7 @@ When a new version of this package arrives: **stop the app, replace the code fol
 ## Troubleshooting
 
 - **"Port already in use"** → something else owns 4173. Set `PORT` to another number (e.g. 8080) and start again.
-- **A key is refused** → EKAM only accepts a key after the provider itself accepts it in a real test call. Check the whole key was copied (keys are shown in full only once at creation), that it belongs to the slot's provider, and — for OpenRouter free models — that the account's Privacy settings allow data use for free endpoints.
+- **A key is refused** → EKAM only accepts the key after NVIDIA itself accepts it in a real test call. Check the whole key was copied (keys are shown in full only once at creation) and that it was created at build.nvidia.com. If a genuinely valid key still fails on a specific model, that model's free endpoint may require data-use consent on the NVIDIA account — check the model's page on build.nvidia.com.
 - **The site forgot everyone** → the `data/` folder was wiped or `DATA_DIR` points somewhere new. Restore it from your backup.
 - **Images/attachments don't load** → the `data/blobs/` folder isn't readable/writable by the app, or `DATA_DIR` moved. Keep the whole `data/` folder together.
 

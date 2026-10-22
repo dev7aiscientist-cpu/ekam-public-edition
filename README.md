@@ -10,24 +10,26 @@ EKAM (एकम् — "The One", from *Ekam Sat*: the truth is one, the wise ca
 
 ## How it works
 
-1. **You bring your own keys.** In **Developer setup**, paste your API keys — OpenRouter, NVIDIA, Groq, Gemini, Claude, Mistral, Cohere, Together, Fireworks, DeepSeek, xAI, Hugging Face, plus fal.ai for image generation. Every key is verified with a **real test call** to the provider before it is accepted; a refused key is never stored, and keys are only ever shown as their last 4 characters.
-2. **You just chat.** Simple questions are answered directly. Bigger work is divided behind the scenes by the Divider AI (strict plan contract, validated server-side), parts run **in parallel** across your connected providers, and the Divider combines them into one reply.
+1. **You bring one key — NVIDIA's.** EKAM runs entirely on NVIDIA's model catalogue. **Developer setup** is a task board: 24 sections, one per task (flagship brain, vision, reasoning, coding, image creation, translation, voice, and more), each naming its model and linking straight to that model's page on build.nvidia.com. Paste your NVIDIA API key into any section — **one NVIDIA key unlocks every section**. The key is verified with a **real test call** to NVIDIA before it is accepted; a refused key is never stored, and the key is only ever shown as its last 4 characters.
+2. **You just chat.** Simple questions are answered directly. Bigger work is divided behind the scenes by the Divider AI (strict plan contract, validated server-side), parts run **in parallel** across the catalogue's models, and the Divider combines them into one reply.
 3. **EKAM learns.** A per-user record of which routes actually delivered (and how fast) quietly steers future work toward proven routes.
-4. **You stay in control.** The **Adjust** panel chooses which capabilities are on, how many AIs work, the thinking level, and the answer length. The chat shows **capability labels only** — never model names — so providers can be swapped invisibly.
-5. **Files welcome.** Attach documents (genuinely read, PDFs included) and photos (sent to a vision-capable connection); ask for an image and it is generated into the chat via fal.ai.
+4. **You stay in control.** The **Adjust** panel chooses which capabilities are on, how many AIs work, the thinking level, and the answer length. The chat shows **capability labels only** — never model names — so models can be swapped invisibly.
+5. **Files welcome.** Attach documents (genuinely read, PDFs included) and photos (sent to the vision model); ask for a picture and EKAM creates it with its NVIDIA image model.
 
 Accounts are per-visitor and fully isolated: your keys, chats, attachments and learning are yours alone.
 
 ## Quick start
 
-Requires [Bun](https://bun.sh).
+**The click way (your own computer):** unzip, then double-click **START.bat** (Windows) or run **start.sh** (Mac/Linux). The first click installs EKAM's parts once; after that, EKAM starts and your browser opens by itself. Keep the window that opens — it is EKAM's engine; close it to stop EKAM. (EKAM needs the free program [Bun](https://bun.sh) — if it's missing, the launcher tells you and opens its page.)
+
+**The command way (servers):**
 
 ```bash
 bun install
 bun run start
 ```
 
-Open http://localhost:4173 → **Try EKAM** → create an account → **Developer setup** → paste a key → chat.
+Open http://localhost:4173 → **Try EKAM** → create an account → **Developer setup** → paste your NVIDIA key → chat.
 
 ## Deploying
 
